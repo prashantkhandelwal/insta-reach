@@ -25,7 +25,7 @@ Sign in to Instagram in that Chrome window. Chrome requires a non-default `--use
 ## Collect
 
 ```powershell
-uv run insta-reach username --keywords "launch,pricing" --max-posts 20
+uv run main username --keywords "launch,pricing" --max-posts 20
 ```
 
 Use a username or full profile URL. Omit `--max-posts` (or use `0`) to scan until the final discovered post. After discovery, the attached Chrome window brings each post to the foreground, expands its comments and replies, and moves to the next post. By default, the script connects to `http://127.0.0.1:9222` and stores resumable progress in `.cache/instagram-comments.json`.
