@@ -5,6 +5,7 @@ description = "Collect Instagram comments through an existing Chrome CDP session
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "emoji==2.14.1",
     "playwright==1.55.0",
 ]
 

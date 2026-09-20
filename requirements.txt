@@ -1,1 +1,2 @@
+emoji==2.14.1
 playwright==1.55.0
