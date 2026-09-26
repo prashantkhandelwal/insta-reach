@@ -12,7 +12,7 @@ from urllib.parse import parse_qsl, urlparse, urlunparse
 
 
 RESERVED_PATHS = {"accounts", "direct", "explore", "p", "reel", "reels", "stories"}
-CACHE_VERSION = 5
+CACHE_VERSION = 6
 COMMENT_CONTROL = re.compile(
     r"view (?:all(?: \d+)? replies|more|previous|replies|\d+ more replies)|load more comments",
     re.IGNORECASE,
@@ -178,6 +178,53 @@ def parse_count(value: str | None) -> int:
     return round(float(match.group(1)) * multiplier)
 
 
+def parse_labeled_count(values: list[str], label: str) -> int | None:
+    pattern = re.compile(
+        rf"([\d,.]+\s*[kmb]?)\s+{re.escape(label)}s?\b",
+        re.IGNORECASE,
+    )
+    for value in values:
+        if match := pattern.search(value):
+            return parse_count(match.group(1))
+    return None
+
+
+def parse_post_likes(values: list[str]) -> int | None:
+    likes = parse_labeled_count(values, "like")
+    if likes is not None:
+        return likes
+
+    others = parse_labeled_count(values, "other")
+    return others + 1 if others is not None else None
+
+
+def read_follower_count(page: Any) -> int | None:
+    candidates = page.evaluate(
+        r"""() => {
+            const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
+            const link = document.querySelector("a[href$='/followers/']");
+            const values = link
+                ? [
+                    link.textContent,
+                    link.getAttribute('title'),
+                    link.getAttribute('aria-label'),
+                    ...[...link.querySelectorAll('[title], [aria-label]')]
+                        .flatMap(element => [
+                            element.getAttribute('title'),
+                            element.getAttribute('aria-label'),
+                        ]),
+                ]
+                : [];
+            values.push(
+                document.querySelector("meta[property='og:description']")
+                    ?.getAttribute('content')
+            );
+            return values.map(normalize).filter(Boolean);
+        }"""
+    )
+    return parse_labeled_count(candidates, "follower")
+
+
 def extract_keywords(text: str, requested_keywords: list[str]) -> list[str]:
     normalized = " ".join(text.lower().split())
     discovered = re.findall(r"(?:#|@)[^\W]+(?:[._][^\W]+)*", normalized, re.UNICODE)
@@ -242,6 +289,7 @@ def load_cache(path: Path, profile_url: str) -> dict[str, Any]:
                 cached["completed_posts"] = []
                 cached["failed_posts"] = []
                 cached["comments"] = []
+            cached.setdefault("follower_count", None)
             cached["cache_version"] = CACHE_VERSION
             return cached
     return {
@@ -251,6 +299,7 @@ def load_cache(path: Path, profile_url: str) -> dict[str, Any]:
         "completed_posts": [],
         "failed_posts": [],
         "comments": [],
+        "follower_count": None,
         "status": "new",
     }
 
@@ -350,6 +399,7 @@ def expand_comments(
     page: Any,
     delay: float,
     profile_name: str,
+    follower_count: int | None,
     requested_keywords: list[str],
 ) -> tuple[int, list[dict[str, Any]]]:
     idle_rounds = 0
@@ -359,18 +409,27 @@ def expand_comments(
     collected: dict[str, dict[str, Any]] = {}
     while idle_rounds < 8 and passes < 1_000:
         passes += 1
-        merge_comment_rows(collected, read_post(page, profile_name, requested_keywords))
+        merge_comment_rows(
+            collected,
+            read_post(page, profile_name, follower_count, requested_keywords),
+        )
         clicked = click_comment_controls(page)
         if clicked:
             page.wait_for_timeout(round(max(delay, 0.75) * 1000))
-            merge_comment_rows(collected, read_post(page, profile_name, requested_keywords))
+            merge_comment_rows(
+                collected,
+                read_post(page, profile_name, follower_count, requested_keywords),
+            )
         metrics = comment_scroll_metrics(page)
         row_count = int(metrics["rowCount"])
         signature = (row_count, int(metrics["scrollHeight"]))
         idle_rounds = idle_rounds + 1 if signature == previous_signature else 0
         previous_signature = signature
         page.wait_for_timeout(round(max(delay, 1.0) * 1000))
-    merge_comment_rows(collected, read_post(page, profile_name, requested_keywords))
+    merge_comment_rows(
+        collected,
+        read_post(page, profile_name, follower_count, requested_keywords),
+    )
     return row_count, list(collected.values())
 
 
@@ -386,7 +445,12 @@ def open_comments(page: Any, delay: float) -> None:
     page.wait_for_timeout(round(max(delay, 1.0) * 1000))
 
 
-def read_post(page: Any, profile_name: str, requested_keywords: list[str]) -> list[dict[str, Any]]:
+def read_post(
+    page: Any,
+    profile_name: str,
+    follower_count: int | None,
+    requested_keywords: list[str],
+) -> list[dict[str, Any]]:
     root = page.locator("article").first
     legacy_layout = bool(root.count())
     if not legacy_layout:
@@ -438,16 +502,34 @@ def read_post(page: Any, profile_name: str, requested_keywords: list[str]) -> li
                         comments = unique;
                     }
 
-                    const likesText = [...root.querySelectorAll('button, span, a, div[role="button"]')]
-            .map(element => normalize(element.textContent))
-            .find(text => /^[\\d,.]+\\s*[kmb]?\\s+likes?$/i.test(text)) || '';
-          return { caption, likesText, comments };
+                    const elementText = element => [
+                        normalize(element.textContent),
+                        normalize(element.getAttribute('aria-label')),
+                        normalize(element.getAttribute('title')),
+                    ];
+                    const likesTexts = [
+                        ...root.querySelectorAll("a[href$='/liked_by/']"),
+                    ].flatMap(elementText);
+                    likesTexts.push(normalize(
+                        document.querySelector("meta[property='og:description']")
+                            ?.getAttribute('content')
+                    ));
+                    likesTexts.push(
+                        ...[...root.querySelectorAll(
+                            "section button, section span, section a"
+                        )].flatMap(elementText)
+                    );
+                    return {
+                        caption,
+                        likesTexts: likesTexts.filter(Boolean),
+                        comments,
+                    };
                 }""",
                 {"legacyLayout": legacy_layout, "profileName": profile_name},
     )
     post_url = page.url.split("?")[0]
     post_keywords = extract_keywords(data["caption"], requested_keywords)
-    post_likes = parse_count(data["likesText"])
+    post_likes = parse_post_likes(data["likesTexts"])
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for comment in data["comments"]:
@@ -462,6 +544,7 @@ def read_post(page: Any, profile_name: str, requested_keywords: list[str]) -> li
         rows.append(
             {
                 "profile_name": profile_name,
+                "follower_count": follower_count if follower_count is not None else "",
                 "post_url": post_url,
                 "post_caption": data["caption"],
                 "post_keywords": post_keywords,
@@ -482,8 +565,9 @@ def export_results(output_dir: Path, profile_name: str, comments: list[dict[str,
     csv_path = output_dir / f"{profile_name}-comments.csv"
     json_path.write_text(json.dumps(comments, ensure_ascii=False, indent=2), encoding="utf-8")
     headers = list(comments[0]) if comments else [
-        "profile_name", "post_url", "post_caption", "post_keywords", "post_likes",
-        "comment_author", "comment_text", "comment_keywords", "comment_likes",
+        "profile_name", "follower_count", "post_url", "post_caption",
+        "post_keywords", "post_likes", "comment_author", "comment_text",
+        "comment_keywords", "comment_likes",
     ]
     with csv_path.open("w", encoding="utf-8-sig", newline="") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=headers)
@@ -536,6 +620,17 @@ def collect(args: argparse.Namespace) -> int:
         worker_page.bring_to_front()
         worker_page.goto(profile_url, wait_until="domcontentloaded", timeout=args.timeout * 1000)
         worker_page.wait_for_selector("main", timeout=args.timeout * 1000)
+        follower_count = read_follower_count(worker_page)
+        if follower_count is None:
+            follower_count = state.get("follower_count")
+        if follower_count is None:
+            print(
+                "Follower count was not found on the profile; it will be blank in the export.",
+                file=sys.stderr,
+            )
+        else:
+            state["follower_count"] = follower_count
+            print(f"Profile followers: {follower_count:,}")
 
         if not state["post_urls"]:
             print(f"Discovering posts on @{profile_name}...")
@@ -560,6 +655,7 @@ def collect(args: argparse.Namespace) -> int:
                     worker_page,
                     args.delay,
                     profile_name,
+                    follower_count,
                     requested_keywords,
                 )
                 state["comments"].extend(comments)

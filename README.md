@@ -34,7 +34,11 @@ CSV and JSON files in `output/` are updated after every post, so comments alread
 
 Network traffic from profile discovery and comment traversal is saved to `output/<profile>-network.har`. The HAR includes response content for document, XHR, and Fetch requests so it can be inspected in Chrome DevTools. Cookie and authorization headers are redacted, but response bodies and URLs can still contain account or profile data; store the file securely.
 
-Each row contains the profile name, post URL, caption, caption keywords, post likes, comment author, comment text, comment keywords, and comment likes. Press `Ctrl+C` to stop safely; rerun the same command to resume.
+Each row contains the profile name, follower count, post URL, caption, caption
+keywords, post likes, comment author, comment text, comment keywords, and comment
+likes. The follower count is read from the profile page and repeated on each
+comment row. Post likes are read from the post's like label or metadata. Press
+`Ctrl+C` to stop safely; rerun the same command to resume.
 
 Use `--fresh` to discard cached progress before collecting the same profile again, especially after changing keywords or the post limit.
 
@@ -49,6 +53,37 @@ Useful options:
 --delay SECONDS   Delay between comment expansion interactions
 --timeout SECONDS Navigation timeout
 ```
+
+## Clean and transform
+
+Run the cleanup script against a collected CSV:
+
+```powershell
+uv run python data-cleanup.py output/ai_drishti-comments.csv
+```
+
+The input CSV path is required. Optionally provide a second path for the cleaned
+CSV, or pass `--in-place` to replace the input file.
+
+The resulting `*-cleaned.csv` removes emoji-only comments, retains every original input column, and appends these analytics columns when they are not already present:
+
+```text
+creator_id, creator_type, follower_count, engagement_rate, comment_length,
+comment_intensity, comment_sentiment_score, content_category,
+audience_interaction_ratio, sentiment_distribution, hashtag_density
+```
+
+`comment_length` is the number of characters. Creator-level metrics are repeated
+on each retained row for that creator and use each post's likes only once:
+
+- `engagement_rate` is `(total likes + total retained comments) / followers * 100`.
+- `comment_intensity` is `total retained comments / followers * 100`.
+- `audience_interaction_ratio` is `total retained comments / total likes`.
+
+These metrics are blank when their denominator is missing or zero.
+`hashtag_density` is caption hashtag tokens divided by all caption tokens.
+Creator type, follower count, sentiment, and content category are copied when
+those columns exist in the source CSV; otherwise they are blank.
 
 ## Test
 

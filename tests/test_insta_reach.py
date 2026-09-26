@@ -14,7 +14,10 @@ from insta_reach import (
     normalize_author,
     normalize_profile_url,
     parse_count,
+    parse_labeled_count,
+    parse_post_likes,
     persist_progress,
+    read_follower_count,
     save_cache,
 )
 
@@ -125,6 +128,30 @@ class InstagramCollectorTests(unittest.TestCase):
         self.assertEqual(parse_count("2,345 likes"), 2345)
         self.assertEqual(parse_count("Like"), 0)
 
+    def test_parse_labeled_count_finds_followers_in_profile_metadata(self) -> None:
+        self.assertEqual(
+            parse_labeled_count(
+                ["12.3K Followers, 250 Following, 85 Posts"],
+                "follower",
+            ),
+            12300,
+        )
+
+    def test_parse_post_likes_supports_direct_and_others_labels(self) -> None:
+        self.assertEqual(parse_post_likes(["2,345 likes"]), 2345)
+        self.assertEqual(
+            parse_post_likes(["Liked by example and 1.2K others"]),
+            1201,
+        )
+        self.assertIsNone(parse_post_likes(["Be the first to like this"]))
+
+    def test_read_follower_count_uses_page_candidates(self) -> None:
+        class FakePage:
+            def evaluate(self, expression):
+                return ["8,765 followers"]
+
+        self.assertEqual(read_follower_count(FakePage()), 8765)
+
     def test_extract_keywords_deduplicates_matches(self) -> None:
         self.assertEqual(
             extract_keywords("Great Launch! #Product by @Maker #product", ["launch", "missing"]),
@@ -175,6 +202,7 @@ class InstagramCollectorTests(unittest.TestCase):
             state["comments"].append(
                 {
                     "profile_name": "example",
+                    "follower_count": 100,
                     "post_url": "https://www.instagram.com/p/one/",
                     "post_caption": "Caption",
                     "post_keywords": ["caption"],
