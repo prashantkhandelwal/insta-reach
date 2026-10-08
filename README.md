@@ -25,10 +25,10 @@ Sign in to Instagram in that Chrome window. Chrome requires a non-default `--use
 ## Collect
 
 ```powershell
-uv run main username --keywords "launch,pricing" --max-posts 20
+uv run main username --keywords "launch,pricing" --max-posts 20 --workers 3
 ```
 
-Use a username or full profile URL. Omit `--max-posts` (or use `0`) to scan until the final discovered post. After discovery, the attached Chrome window brings each post to the foreground, expands its comments and replies, and moves to the next post. By default, the script connects to `http://127.0.0.1:9222` and stores resumable progress in `.cache/instagram-comments.json`.
+Use a username or full profile URL. Omit `--max-posts` (or use `0`) to scan until the final discovered post. After discovery, each worker opens an independent page in the attached Chrome session and processes its assigned posts sequentially. `--workers` defaults to `1`; keep the value low to avoid excessive Instagram requests. By default, the script connects to `http://127.0.0.1:9222` and stores resumable progress in `.cache/instagram-comments.json`.
 
 CSV and JSON files in `output/` are updated after every post, so comments already collected remain available if the script is interrupted. The script clicks Instagram's accessible **Load more comments** control, scrolls the internal comment panel until no additional comments load, and expands visible reply threads along the way. It snapshots comments after every load because Instagram may remove older rows from the DOM while scrolling; posts with many comments will therefore take longer.
 
@@ -50,6 +50,7 @@ Useful options:
 --har PATH        Custom HAR output file
 --cache PATH      Progress cache file
 --fresh           Discard cached progress
+--workers COUNT   Concurrent post workers (default: 1)
 --delay SECONDS   Delay between comment expansion interactions
 --timeout SECONDS Navigation timeout
 ```

@@ -5,8 +5,11 @@ import csv
 import json
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from queue import Queue
 from typing import Any
 from urllib.parse import parse_qsl, urlparse, urlunparse
 
@@ -24,6 +27,26 @@ VIEW_REPLIES = re.compile(
 )
 SENSITIVE_HEADERS = {"authorization", "cookie", "proxy-authorization", "set-cookie"}
 BODY_RESOURCE_TYPES = {"Document", "Fetch", "XHR"}
+
+
+@dataclass(frozen=True)
+class PostJob:
+    index: int
+    total: int
+    url: str
+
+
+@dataclass(frozen=True)
+class PostResult:
+    job: PostJob
+    loaded_rows: int
+    comments: list[dict[str, Any]]
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkerResult:
+    har_entries: list[dict[str, Any]]
 
 
 def har_headers(headers: dict[str, Any]) -> list[dict[str, str]]:
@@ -150,18 +173,21 @@ class HarRecorder:
         entry["response"]["_error"] = event.get("errorText", "Request failed")
         self.entries.append(entry)
 
-    def save(self, path: Path) -> None:
+    def finish(self) -> list[dict[str, Any]]:
         for entry in self.pending.values():
             entry.pop("_resourceType", None)
             entry.pop("_startTimestamp", None)
             self.entries.append(entry)
         self.pending.clear()
+        return self.entries
+
+    def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         document = {
             "log": {
                 "version": "1.2",
                 "creator": {"name": "insta-reach", "version": "0.1.0"},
-                "entries": self.entries,
+                "entries": self.finish(),
             }
         }
         path.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -587,6 +613,123 @@ def persist_progress(
     return export_results(output_dir, profile_name, state["comments"])
 
 
+def partition_post_jobs(
+    pending: list[str],
+    completed_count: int,
+    total: int,
+    workers: int,
+) -> list[list[PostJob]]:
+    jobs = [
+        PostJob(index=completed_count + offset, total=total, url=url)
+        for offset, url in enumerate(pending, start=1)
+    ]
+    worker_count = min(workers, len(jobs))
+    return [jobs[index::worker_count] for index in range(worker_count)]
+
+
+def collect_post(page: Any, job: PostJob, delay: float, timeout: int, profile_name: str,
+                 follower_count: int | None, requested_keywords: list[str]) -> PostResult:
+    print(f"[{job.index}/{job.total}] Opening {job.url}")
+    try:
+        page.goto(job.url, wait_until="domcontentloaded", timeout=timeout * 1000)
+        page.wait_for_selector("main", timeout=timeout * 1000)
+        open_comments(page, delay)
+        loaded_rows, comments = expand_comments(
+            page,
+            delay,
+            profile_name,
+            follower_count,
+            requested_keywords,
+        )
+        return PostResult(job=job, loaded_rows=loaded_rows, comments=comments)
+    except Exception as error:
+        return PostResult(job=job, loaded_rows=0, comments=[], error=str(error))
+
+
+def collect_post_batch(
+    jobs: list[PostJob],
+    results: Queue[PostResult],
+    cdp_url: str,
+    delay: float,
+    timeout: int,
+    profile_name: str,
+    follower_count: int | None,
+    requested_keywords: list[str],
+    sync_playwright: Any,
+) -> WorkerResult:
+    playwright = None
+    page = None
+    cdp_session = None
+    har_recorder = None
+    next_job = 0
+    try:
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.connect_over_cdp(cdp_url)
+        if not browser.contexts:
+            raise RuntimeError("Chrome exposed no browser context over CDP.")
+        context = browser.contexts[0]
+        page = context.new_page()
+        cdp_session = context.new_cdp_session(page)
+        har_recorder = HarRecorder(cdp_session)
+        har_recorder.start()
+        for next_job, job in enumerate(jobs):
+            results.put(collect_post(
+                page,
+                job,
+                delay,
+                timeout,
+                profile_name,
+                follower_count,
+                requested_keywords,
+            ))
+        next_job = len(jobs)
+    except Exception as error:
+        for job in jobs[next_job:]:
+            results.put(
+                PostResult(job=job, loaded_rows=0, comments=[], error=str(error))
+            )
+    finally:
+        har_entries: list[dict[str, Any]] = []
+        if har_recorder is not None:
+            if page is not None:
+                try:
+                    page.wait_for_timeout(500)
+                except Exception:
+                    pass
+            har_entries = list(har_recorder.finish())
+        if cdp_session is not None:
+            try:
+                cdp_session.detach()
+            except Exception:
+                pass
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                pass
+        if playwright is not None:
+            playwright.stop()
+    return WorkerResult(har_entries=har_entries)
+
+
+def apply_post_result(state: dict[str, Any], result: PostResult) -> None:
+    post_url = result.job.url
+    state["failed_posts"] = [
+        failure for failure in state["failed_posts"]
+        if failure.get("post_url") != post_url
+    ]
+    if result.error is not None:
+        state["failed_posts"].append({"post_url": post_url, "error": result.error})
+        print(f"  Skipped {post_url}: {result.error}", file=sys.stderr)
+        return
+    state["comments"].extend(result.comments)
+    state["completed_posts"].append(post_url)
+    print(
+        f"  Loaded {result.loaded_rows} comment rows from {post_url}; "
+        f"saved {len(result.comments)} comments ({len(state['comments'])} total)."
+    )
+
+
 def collect(args: argparse.Namespace) -> int:
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -644,38 +787,50 @@ def collect(args: argparse.Namespace) -> int:
         pending = [url for url in state["post_urls"] if url not in completed]
         state["status"] = "collecting"
         state.pop("error", None)
-        for index, post_url in enumerate(pending, start=len(completed) + 1):
-            print(f"[{index}/{len(state['post_urls'])}] Opening {post_url}")
-            try:
-                worker_page.bring_to_front()
-                worker_page.goto(post_url, wait_until="domcontentloaded", timeout=args.timeout * 1000)
-                worker_page.wait_for_selector("main", timeout=args.timeout * 1000)
-                open_comments(worker_page, args.delay)
-                loaded_rows, comments = expand_comments(
-                    worker_page,
-                    args.delay,
-                    profile_name,
-                    follower_count,
-                    requested_keywords,
-                )
-                state["comments"].extend(comments)
-                state["completed_posts"].append(post_url)
-                state["failed_posts"] = [
-                    failure for failure in state["failed_posts"]
-                    if failure.get("post_url") != post_url
-                ]
-                print(
-                    f"  Loaded {loaded_rows} comment rows; saved {len(comments)} comments "
-                    f"({len(state['comments'])} total)."
-                )
-            except Exception as error:
-                state["failed_posts"] = [
-                    failure for failure in state["failed_posts"]
-                    if failure.get("post_url") != post_url
-                ]
-                state["failed_posts"].append({"post_url": post_url, "error": str(error)})
-                print(f"  Skipped: {error}", file=sys.stderr)
-            persist_progress(cache_path, output_dir, profile_name, state)
+        if pending:
+            worker_page.wait_for_timeout(500)
+            har_recorder.finish()
+            cdp_session.detach()
+            cdp_session = None
+            worker_page.close()
+            worker_page = None
+            playwright.stop()
+            playwright = None
+
+            batches = partition_post_jobs(
+                pending,
+                len(completed),
+                len(state["post_urls"]),
+                args.workers,
+            )
+            print(f"Collecting {len(pending)} posts with {len(batches)} worker(s).")
+            worker_results: Queue[PostResult] = Queue()
+            with ThreadPoolExecutor(
+                max_workers=len(batches),
+                thread_name_prefix="insta-reach",
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        collect_post_batch,
+                        batch,
+                        worker_results,
+                        args.cdp_url,
+                        args.delay,
+                        args.timeout,
+                        profile_name,
+                        follower_count,
+                        requested_keywords,
+                        sync_playwright,
+                    ): batch
+                    for batch in batches
+                }
+                for _ in pending:
+                    result = worker_results.get()
+                    apply_post_result(state, result)
+                    persist_progress(cache_path, output_dir, profile_name, state)
+                for future in as_completed(futures):
+                    worker_result = future.result()
+                    har_recorder.entries.extend(worker_result.har_entries)
 
         state["status"] = "complete_with_errors" if state["failed_posts"] else "complete"
         json_path, csv_path = persist_progress(
@@ -721,7 +876,8 @@ def collect(args: argparse.Namespace) -> int:
                 worker_page.close()
             except Exception:
                 pass
-        playwright.stop()
+        if playwright is not None:
+            playwright.stop()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -734,6 +890,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--har", help="HAR output path; defaults to output/<profile>-network.har")
     parser.add_argument("--cache", default=".cache/instagram-comments.json", help="Progress cache file")
     parser.add_argument("--fresh", action="store_true", help="Discard cached progress and start again")
+    parser.add_argument("--workers", type=int, default=1, help="Concurrent post workers")
     parser.add_argument("--delay", type=float, default=0.8, help="Seconds between page interactions")
     parser.add_argument("--timeout", type=int, default=30, help="Navigation timeout in seconds")
     return parser
@@ -741,8 +898,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    if args.max_posts < 0 or args.delay < 0 or args.timeout <= 0:
-        print("--max-posts and --delay must be non-negative; --timeout must be positive.", file=sys.stderr)
+    if args.max_posts < 0 or args.delay < 0 or args.timeout <= 0 or args.workers <= 0:
+        print(
+            "--max-posts and --delay must be non-negative; "
+            "--timeout and --workers must be positive.",
+            file=sys.stderr,
+        )
         return 2
     return collect(args)
 

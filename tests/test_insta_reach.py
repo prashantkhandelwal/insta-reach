@@ -16,6 +16,7 @@ from insta_reach import (
     parse_count,
     parse_labeled_count,
     parse_post_likes,
+    partition_post_jobs,
     persist_progress,
     read_follower_count,
     save_cache,
@@ -221,6 +222,34 @@ class InstagramCollectorTests(unittest.TestCase):
             self.assertTrue(cache_path.exists())
             self.assertEqual(json.loads(json_path.read_text(encoding="utf-8")), state["comments"])
             self.assertIn("viewer", csv_path.read_text(encoding="utf-8-sig"))
+
+    def test_partition_post_jobs_uses_requested_workers(self) -> None:
+        batches = partition_post_jobs(
+            ["post-1", "post-2", "post-3", "post-4", "post-5"],
+            completed_count=2,
+            total=7,
+            workers=3,
+        )
+
+        self.assertEqual(len(batches), 3)
+        self.assertEqual(
+            [[job.url for job in batch] for batch in batches],
+            [["post-1", "post-4"], ["post-2", "post-5"], ["post-3"]],
+        )
+        self.assertEqual(
+            [job.index for batch in batches for job in batch],
+            [3, 6, 4, 7, 5],
+        )
+
+    def test_partition_post_jobs_caps_workers_at_pending_posts(self) -> None:
+        batches = partition_post_jobs(
+            ["post-1", "post-2"],
+            completed_count=0,
+            total=2,
+            workers=5,
+        )
+
+        self.assertEqual(len(batches), 2)
 
 
 if __name__ == "__main__":
